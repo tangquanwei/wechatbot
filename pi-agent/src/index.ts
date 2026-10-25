@@ -28,6 +28,16 @@ import { readFile, writeFile, mkdtemp } from 'node:fs/promises'
 import { basename, join, extname } from 'node:path'
 import { tmpdir } from 'node:os'
 
+// ── 每日提醒（daily nudge）配置 ──────────────────────────────────
+const NUDGE_HOUR = 23
+const NUDGE_MINUTE = 0
+const NUDGE_TEXT = '今天有没有变得更聪明一点？\n有没有把自己的目标往前推进一步？'
+
+function localDate(d: Date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
 export default function wechatBridge(pi: ExtensionAPI) {
   let bot: WeChatBot | null = null
   let connected = false
@@ -35,6 +45,44 @@ export default function wechatBridge(pi: ExtensionAPI) {
   let pendingReply: IncomingMessage | null = null
   let assistantText = ''
   let isStreaming = false
+  let ctxRef: { ui: { setStatus: (k: string, v?: string) => void; notify: (m: string, level?: any) => void } } | null = null
+
+  // ── 每日提醒（daily nudge）状态 ──────────────────────────────────
+  let lastIncomingDate = '' // 最近一次收到用户消息的本地日期
+  let lastNudgeDate = '' // 最近一次成功发送提醒的本地日期
+  let nudgeTimer: ReturnType<typeof setInterval> | null = null
+
+  const fireNudge = async (force = false) => {
+    if (!bot || !connected) return
+    const today = localDate()
+    if (!force) {
+      if (lastNudgeDate === today) return // 今天已提醒过
+      if (lastIncomingDate === today) return // 今天已经聊过，不打扰
+    }
+    const userId = activeUserId ?? bot.getCredentials()?.userId
+    if (!userId) return
+    try {
+      await bot.send(userId, NUDGE_TEXT)
+      lastNudgeDate = today
+      ctxRef?.ui.setStatus('wechat', '⏰ nudge sent')
+    } catch (e) {
+      ctxRef?.ui.setStatus('wechat', `⏰ nudge failed: ${e instanceof Error ? e.message : e}`)
+    }
+  }
+
+  // 每 60 秒检查一次（而不是一次性定时器）：笔记本合盖睡过 23:00，醒来后立刻补发
+  const startNudgeScheduler = () => {
+    if (nudgeTimer) return
+    nudgeTimer = setInterval(() => {
+      const now = new Date()
+      const afterWindow = now.getHours() * 60 + now.getMinutes() >= NUDGE_HOUR * 60 + NUDGE_MINUTE
+      if (afterWindow) fireNudge()
+    }, 60_000)
+  }
+
+  const stopNudgeScheduler = () => {
+    if (nudgeTimer) { clearInterval(nudgeTimer); nudgeTimer = null }
+  }
 
   // ── Inject system prompt so agent knows about WeChat bridge ────────
 
@@ -187,9 +235,11 @@ Key behaviors:
       ctx.ui.setStatus('wechat', `✓ WeChat: ${creds.accountId}`)
       ctx.ui.notify(`WeChat connected!\nAccount: ${creds.accountId}`, 'info')
       connected = true
+      startNudgeScheduler()
 
       bot.onMessage(async (msg: IncomingMessage) => {
         activeUserId = msg.userId
+        lastIncomingDate = localDate()
         pendingReply = msg
         isStreaming = true
         assistantText = ''
@@ -236,12 +286,23 @@ Key behaviors:
     handler: startWechat,
   })
 
+  pi.registerCommand('nudge', {
+    description: '立即发送每日提醒（忽略“今天已聊过”的判断，用于测试）',
+    handler: async (_args, ctx) => {
+      ctxRef = ctx as any
+      await fireNudge(true)
+      ctx.ui.notify('nudge sent (force)', 'info')
+    },
+  })
+
   pi.on('session_shutdown', async () => {
+    stopNudgeScheduler()
     if (bot) { bot.stop(); bot = null }
     connected = false
   })
 
   pi.on('session_start', async (_event, ctx) => {
+    ctxRef = ctx as any
     if (connected && bot) {
       ctx.ui.setStatus('wechat', `✓ WeChat: ${bot.getCredentials()?.accountId ?? 'connected'}`)
     }
