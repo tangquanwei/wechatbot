@@ -24,14 +24,19 @@ import {
   type IncomingMessage,
 } from '@wechatbot/wechatbot'
 import qrTerminal from 'qrcode-terminal'
-import { readFile, writeFile, mkdtemp } from 'node:fs/promises'
+import { readFile, writeFile, mkdtemp, appendFile } from 'node:fs/promises'
 import { basename, join, extname } from 'node:path'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 
 // ── 每日提醒（daily nudge）配置 ──────────────────────────────────
 const NUDGE_HOUR = 23
 const NUDGE_MINUTE = 0
 const NUDGE_TEXT = '今天有没有变得更聪明一点？\n有没有把自己的目标往前推进一步？'
+
+const NUDGE_LOG = join(homedir(), '.wechatbot', 'nudge.log')
+function noteNudge(line: string) {
+  appendFile(NUDGE_LOG, `${new Date().toLocaleString('sv-SE')} ${line}\n`).catch(() => {})
+}
 
 function localDate(d: Date = new Date()): string {
   const pad = (n: number) => String(n).padStart(2, '0')
@@ -53,19 +58,21 @@ export default function wechatBridge(pi: ExtensionAPI) {
   let nudgeTimer: ReturnType<typeof setInterval> | null = null
 
   const fireNudge = async (force = false) => {
-    if (!bot || !connected) return
+    if (!bot || !connected) return noteNudge('skip: not connected')
     const today = localDate()
     if (!force) {
-      if (lastNudgeDate === today) return // 今天已提醒过
-      if (lastIncomingDate === today) return // 今天已经聊过，不打扰
+      if (lastNudgeDate === today) return noteNudge('skip: already nudged today')
+      if (lastIncomingDate === today) return noteNudge('skip: user already chatted today')
     }
     const userId = activeUserId ?? bot.getCredentials()?.userId
-    if (!userId) return
+    if (!userId) return noteNudge('skip: no userId')
     try {
       await bot.send(userId, NUDGE_TEXT)
       lastNudgeDate = today
+      noteNudge(`sent -> ${userId}${force ? ' (force)' : ''}`)
       ctxRef?.ui.setStatus('wechat', '⏰ nudge sent')
     } catch (e) {
+      noteNudge(`failed: ${e instanceof Error ? e.message : e}`)
       ctxRef?.ui.setStatus('wechat', `⏰ nudge failed: ${e instanceof Error ? e.message : e}`)
     }
   }
